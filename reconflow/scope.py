@@ -11,14 +11,22 @@ Supports two input formats:
      "eligible_for_submission" / "instruction" containing "out of scope"
   2. Plain text, one entry per line:
        example.com
-       *.example.com
+       *.example.com              <- subdomains only, not the apex
        !excluded.example.com      <- leading "!" means explicitly out of scope
        # comments and blank lines ignored
+
+Wildcard semantics: a leading "*." matches one or more labels, so
+"*.example.com" covers a.example.com and a.b.example.com but NOT
+example.com itself. Any other "*" or "?" stays within a single label,
+so "dev-*.example.com" matches dev-a.example.com but not
+dev-a.b.example.com. Out-of-scope wildcards are read broadly instead:
+"!*.internal.example.com" also excludes internal.example.com, since
+excluding too much is the safe failure mode.
 """
 
-import fnmatch
 import ipaddress
 import json
+import re
 from pathlib import Path
 
 
@@ -32,9 +40,7 @@ def _normalize(asset: str) -> str:
         parts = asset.split(":")
         if len(parts) == 2 and parts[1].isdigit():
             asset = parts[0]
-    if asset.startswith("*."):
-        asset = asset[2:]
-    elif asset.startswith("."):
+    if asset.startswith("."):
         asset = asset[1:]
     return asset
 
@@ -98,7 +104,21 @@ def load_scope(path: str):
     return {"in_scope": in_scope, "out_of_scope": out_of_scope}
 
 
-def _matches_pattern(host: str, pattern: str) -> bool:
+def _wildcard_regex(pattern: str, include_apex: bool):
+    """Translate a scope wildcard into a label-aware regex."""
+    prefix = ""
+    if pattern.startswith("*."):
+        # One or more whole labels; zero or more if the apex should match too.
+        prefix = r"(?:[^.]+\.)*" if include_apex else r"(?:[^.]+\.)+"
+        pattern = pattern[2:]
+    body = "".join(
+        "[^.]*" if ch == "*" else "[^.]" if ch == "?" else re.escape(ch)
+        for ch in pattern
+    )
+    return re.compile(prefix + body)
+
+
+def _matches_pattern(host: str, pattern: str, include_apex: bool = False) -> bool:
     host = host.lower()
     pattern = pattern.lower()
 
@@ -110,27 +130,21 @@ def _matches_pattern(host: str, pattern: str) -> bool:
     except ValueError:
         pass
 
-    # 2. Exact hostname match
+    # 2. Wildcard matching (e.g. *.example.com, dev-*.example.com)
+    if "*" in pattern or "?" in pattern:
+        return _wildcard_regex(pattern, include_apex).fullmatch(host) is not None
+
+    # 3. Exact hostname match
     if host == pattern:
         return True
 
-    # 3. Subdomain match (e.g. api.example.com matches example.com)
-    if host.endswith(f".{pattern}"):
-        return True
-
-    # 4. Glob / wildcard matching if pattern contains wildcards (e.g. dev-*.example.com)
-    if "*" in pattern or "?" in pattern:
-        if fnmatch.fnmatch(host, pattern):
-            return True
-        if pattern.startswith("*.") and host == pattern[2:]:
-            return True
-
-    return False
+    # 4. Subdomain match (e.g. api.example.com matches example.com)
+    return host.endswith(f".{pattern}")
 
 
-def _matches_any(host: str, patterns) -> bool:
+def _matches_any(host: str, patterns, include_apex: bool = False) -> bool:
     for pattern in patterns:
-        if _matches_pattern(host, pattern):
+        if _matches_pattern(host, pattern, include_apex):
             return True
     return False
 
@@ -149,7 +163,7 @@ def filter_in_scope(subdomains, scope: dict, output_dir: Path = None):
                 clean = parts[0]
         clean = clean.lower().strip()
 
-        if _matches_any(clean, out_of_scope_patterns):
+        if _matches_any(clean, out_of_scope_patterns, include_apex=True):
             dropped.append(host)
         elif not in_scope_patterns or _matches_any(clean, in_scope_patterns):
             kept.append(host)

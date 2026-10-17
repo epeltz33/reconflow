@@ -36,7 +36,7 @@ class TestScope(unittest.TestCase):
                  "eligible_for_submission": True},
             ]))
             scope = load_scope(str(scope_file))
-            self.assertIn("example.com", scope["in_scope"])
+            self.assertIn("*.example.com", scope["in_scope"])
             self.assertIn("internal.example.com", scope["out_of_scope"])
             # Mobile app IDs should be skipped, not treated as domains
             self.assertNotIn("com.example.app", scope["in_scope"])
@@ -98,6 +98,54 @@ class TestScope(unittest.TestCase):
         self.assertIn("https://api.example.com:8443/graphql", kept)
         self.assertIn("http://example.com/", kept)
         self.assertIn("http://admin.example.com:80/console", dropped)
+
+    def test_wildcard_excludes_apex(self):
+        """*.example.com covers subdomains at any depth, but not the apex itself."""
+        scope = {"in_scope": ["*.example.com"], "out_of_scope": []}
+        kept, dropped = filter_in_scope(
+            ["example.com", "api.example.com", "a.b.example.com", "evilexample.com"], scope
+        )
+        self.assertEqual(kept, ["api.example.com", "a.b.example.com"])
+        self.assertIn("example.com", dropped)
+        self.assertIn("evilexample.com", dropped)
+
+    def test_inner_wildcard_stays_within_one_label(self):
+        scope = {"in_scope": ["dev-*.example.com"], "out_of_scope": []}
+        kept, dropped = filter_in_scope(
+            ["dev-a.example.com", "dev-a.b.example.com", "prod.dev-a.example.com"], scope
+        )
+        self.assertEqual(kept, ["dev-a.example.com"])
+        self.assertIn("dev-a.b.example.com", dropped)
+        self.assertIn("prod.dev-a.example.com", dropped)
+
+    def test_question_mark_matches_single_character(self):
+        scope = {"in_scope": ["api?.example.com"], "out_of_scope": []}
+        kept, _ = filter_in_scope(
+            ["api1.example.com", "api12.example.com", "api.example.com"], scope
+        )
+        self.assertEqual(kept, ["api1.example.com"])
+
+    def test_out_of_scope_wildcard_also_excludes_apex(self):
+        """Exclusions read broadly: !*.internal.example.com drops internal.example.com too."""
+        scope = {"in_scope": ["*.example.com"], "out_of_scope": ["*.internal.example.com"]}
+        kept, dropped = filter_in_scope(
+            ["api.example.com", "internal.example.com", "db.internal.example.com"], scope
+        )
+        self.assertEqual(kept, ["api.example.com"])
+        self.assertIn("internal.example.com", dropped)
+        self.assertIn("db.internal.example.com", dropped)
+
+    def test_plain_text_wildcard_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scope_file = Path(tmpdir) / "scope.txt"
+            scope_file.write_text("*.example.com\n!*.staging.example.com\n")
+            scope = load_scope(str(scope_file))
+            self.assertEqual(scope["in_scope"], ["*.example.com"])
+            kept, _ = filter_in_scope(
+                ["example.com", "www.example.com", "staging.example.com", "x.staging.example.com"],
+                scope,
+            )
+            self.assertEqual(kept, ["www.example.com"])
 
 
 class TestTakeover(unittest.TestCase):
